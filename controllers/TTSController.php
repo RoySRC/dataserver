@@ -30,9 +30,16 @@ use Aws\DynamoDb\DynamoDbClient;
 
 class TTSController extends ApiController {
 	private bool $testMode = false;
+	private ?array $liveRateLimit = null;
 
 	// Must match ExpirationInDays in cloudformation/tts/template.yaml.j2
 	const AUDIO_CACHE_DAYS = 90;
+
+	// Retention of per-user records and per-day markers in the TTS table, via
+	// DynamoDB TTL on 'expiresAt'. Totals without user IDs (DAILY_STATS,
+	// LOCALE_STATS) and credit bundles don't expire.
+	const USER_DATA_RETENTION_DAYS = 395; // ~13 months
+	const MARKER_RETENTION_DAYS = 62;
 
 	// Minimal valid silent audio files (~50ms) for unspeakable input
 	private static $silentAudio = [
@@ -169,6 +176,8 @@ class TTSController extends ApiController {
 			$this->e400("API key not provided");
 		}
 
+		$this->liveRateLimit = $this->getLiveRateLimit($params);
+
 		$client = self::detectClientPlatform($_SERVER['HTTP_USER_AGENT'] ?? '');
 
 		$hexID = $params['voice'] ?? '';
@@ -273,6 +282,7 @@ class TTSController extends ApiController {
 		$estimatedDuration = strlen($text) / 15;
 		$estimatedCreditCost = $estimatedDuration * $creditRate / 60;
 		$this->checkQuota($this->userID, $tier, $estimatedCreditCost, $estimatedDuration);
+		$this->checkLiveRateLimit();
 
 		// Synthesize audio
 		$options = array_merge($resolved, [
@@ -362,6 +372,7 @@ class TTSController extends ApiController {
 			'synthesisMS' => $synthesisMS,
 			'client' => $client,
 		]);
+		$this->debitLiveRateLimit($audioDuration > 0 ? $audioDuration : $estimatedDuration);
 
 		header("Cache-Control: private, max-age=" . (self::AUDIO_CACHE_DAYS * 86400) . ", immutable");
 		if ($timestampsRequested) {
@@ -485,6 +496,10 @@ class TTSController extends ApiController {
 		echo json_encode([
 			'standardCreditsRemaining' => $standardUsage['monthlyRemaining'],
 			'premiumCreditsRemaining' => $premiumUsage['monthlyRemaining'],
+			// Plan the TTS limits are based on: free, personal, lab, or institutional.
+			// Users covered by an institution are reported as institutional/lab even if
+			// they also have a personal subscription.
+			'plan' => $premiumUsage['subType'],
 		]);
 	}
 
@@ -631,6 +646,11 @@ class TTSController extends ApiController {
 
 
 	private function getTTSCreditLimits(int $userID): array {
+		static $cache = [];
+		if (isset($cache[$userID])) {
+			return $cache[$userID];
+		}
+
 		$personalQuota = Zotero_Storage::getUserValues($userID);
 		$hasPersonal = $personalQuota && $personalQuota['expiration'] >= time();
 
@@ -639,25 +659,85 @@ class TTSController extends ApiController {
 
 		$limits = Z_CONFIG::$TTS_CREDIT_LIMITS;
 
+		$institution = $hasInstitutional ? self::getInstitution($userID) : null;
+
 		if ($hasInstitutional) {
-			$subType = 'institutional';
+			$limitType = 'institutional';
+			// Lab plans use the institutional limits but are counted separately
+			// in usage stats
+			$subType = $institution && $institution['lab'] ? 'lab' : 'institutional';
 		}
 		else if ($hasPersonal) {
-			$subType = 'personal';
+			$limitType = $subType = 'personal';
 		}
 		else {
-			$subType = 'free';
+			$limitType = $subType = 'free';
 		}
 
-		return [
-			'standard' => $limits['standard'][$subType],
-			'premium' => $limits['premium'][$subType],
+		return $cache[$userID] = [
+			'standard' => $limits['standard'][$limitType],
+			'premium' => $limits['premium'][$limitType],
+			'subType' => $subType,
+			'institutionID' => $institution['institutionID'] ?? null,
 		];
 	}
 
 
 	/**
-	 * @return array{monthlyUsed:int, monthlyRemaining:int}
+	 * Get the institutional plan covering the user, for usage stats: a lab plan
+	 * (an email list with no domain) if the user is on one, so lab usage can be
+	 * counted separately, and otherwise the plan with the largest storage quota,
+	 * as in Zotero_Storage::getInstitutionalUserQuota()
+	 *
+	 * @return array{institutionID:int, lab:bool}|null
+	 */
+	private static function getInstitution(int $userID): ?array {
+		$dev = Z_ENV_TESTING_SITE ? "_dev" : "";
+		$databaseName = "zotero_www{$dev}";
+		// Domain match, from Zotero_Storage::getInstitutionalUserQuota()
+		$sql = "SELECT institutionID, domain = '' AS lab, storageQuota "
+			. "FROM $databaseName.users_email "
+			. "JOIN $databaseName.storage_institutions "
+			. "ON (domain != '' "
+				. "AND SUBSTRING_INDEX(email, '@', -1) REGEXP CONCAT('^(.+\\\.)?', domain, '$')"
+				. "AND (domainBlacklist = '' "
+					. "OR SUBSTRING_INDEX(email, '@', -1) NOT REGEXP domainBlacklist)"
+			. ") WHERE userID=? AND validated=1 "
+			. "UNION ALL "
+			// Email match
+			. "SELECT institutionID, domain = '' AS lab, storageQuota "
+			. "FROM $databaseName.users_email "
+			. "JOIN $databaseName.storage_institution_email USING (email) "
+			. "JOIN $databaseName.storage_institutions USING (institutionID) "
+			. "WHERE userID=? AND validated=1";
+		try {
+			$rows = Zotero_WWW_DB_2::query($sql, [$userID, $userID]);
+		}
+		catch (Exception $e) {
+			Z_Core::logError("WARNING: $e -- retrying on primary");
+			$rows = Zotero_WWW_DB_1::query($sql, [$userID, $userID]);
+		}
+		$best = null;
+		foreach ($rows ?: [] as $row) {
+			$rank = [(bool) $row['lab'], (int) $row['storageQuota']];
+			if (!$best || $rank > $best['rank']) {
+				$best = [
+					'institutionID' => (int) $row['institutionID'],
+					'lab' => (bool) $row['lab'],
+					'rank' => $rank,
+				];
+			}
+		}
+		if (!$best) {
+			return null;
+		}
+		unset($best['rank']);
+		return $best;
+	}
+
+
+	/**
+	 * @return array{monthlyUsed:int, monthlyRemaining:int, limit:int, subType:string}
 	 */
 	private function getCreditsRemaining(int $userID, string $tier): array {
 		$tableName = Z_CONFIG::$TTS_TABLE;
@@ -691,6 +771,8 @@ class TTSController extends ApiController {
 		return [
 			'monthlyUsed' => $monthlyUsed,
 			'monthlyRemaining' => $subscriptionRemaining + $bundleCredits,
+			'limit' => $limits[$tier],
+			'subType' => $limits['subType'],
 		];
 	}
 
@@ -816,15 +898,185 @@ class TTSController extends ApiController {
 	}
 
 
+	/**
+	 * Get the per-user bucket that caps synthesis throughput, in seconds of
+	 * audio, for live listening
+	 *
+	 * Test requests skip the bucket unless they pass 'rateLimit' with
+	 * 'bucket', 'capacity', and 'replenishRate', which selects an isolated,
+	 * always-enforced bucket for testing.
+	 */
+	private function getLiveRateLimit(array $params): ?array {
+		if ($this->testMode) {
+			$rateLimit = $params['rateLimit'] ?? null;
+			if ($rateLimit === null) {
+				return null;
+			}
+			if (!is_array($rateLimit)
+					|| !preg_match('/^[A-Za-z0-9]{1,32}$/', $rateLimit['bucket'] ?? '')
+					|| !is_numeric($rateLimit['capacity'] ?? null)
+					|| !is_numeric($rateLimit['replenishRate'] ?? null)
+					|| $rateLimit['replenishRate'] <= 0) {
+				$this->e400("Invalid 'rateLimit'");
+			}
+			return [
+				'logOnly' => false,
+				'bucket' => 'tts-live-test-' . $this->userID . '-' . $rateLimit['bucket'],
+				'replenishRate' => (float) $rateLimit['replenishRate'],
+				'capacity' => (float) $rateLimit['capacity'],
+			];
+		}
+		return $this->buildRateLimit(
+			'tts_live', 'tts-live-' . $this->userID, $this->isRateLimitEnforced()
+		);
+	}
+
+
+	/**
+	 * Reject a cache miss with a 429 if the live bucket has less than one
+	 * second of audio left
+	 *
+	 * Allows the request if the limiter is unavailable.
+	 */
+	private function checkLiveRateLimit(): void {
+		$limit = $this->liveRateLimit;
+		if (!$limit) {
+			return;
+		}
+		try {
+			if (!Z_RequestLimiter::init()) return;
+		}
+		catch (Exception $e) {
+			Z_Core::logError("Warning: " . $e->getMessage());
+			return;
+		}
+		$balance = Z_RequestLimiter::getBucketBalance($limit);
+		if ($balance === null || $balance >= 1) {
+			return;
+		}
+		$retryAfter = max(1, (int) ceil((1 - $balance) / $limit['replenishRate']));
+		StatsD::increment('api.request.limit.tts_live.rejected', 1);
+		Z_Core::logError(($limit['logOnly'] ? '(WARN) ' : '')
+			. 'TTS live rate limit exceeded for ' . $limit['bucket']
+			. ' (balance ' . round($balance) . ', retry after ' . $retryAfter . 's)'
+			. ' (' . ($_SERVER['HTTP_USER_AGENT'] ?? '') . ')');
+		if (!$limit['logOnly']) {
+			header('Retry-After: ' . $retryAfter);
+			$this->e429('TTS rate limit exceeded');
+		}
+	}
+
+
+	private function debitLiveRateLimit(float $duration): void {
+		if (!$this->liveRateLimit || !Z_RequestLimiter::isInitialized()) {
+			return;
+		}
+		Z_RequestLimiter::debitBucket($this->liveRateLimit, $duration);
+	}
+
+
 	private function checkQuota(int $userID, string $tier, float $estimatedCreditCost, float $estimatedDuration): void {
 		$usage = $this->getCreditsRemaining($userID, $tier);
 		if ($estimatedCreditCost > $usage['monthlyRemaining'] && !$this->testMode) {
+			$this->logFirstCapHit($userID, $tier, $usage);
 			$this->e402("quota_exceeded");
 		}
 		$estimatedMinutes = (int) ceil($estimatedDuration / 60);
 		$dailyMinutes = $this->getDailyMinutesRemaining($userID);
 		if ($estimatedMinutes > $dailyMinutes && !$this->testMode) {
+			$this->logDailyLimitHit($userID, $tier, $usage['subType']);
 			$this->e402("daily_limit_exceeded");
+		}
+	}
+
+
+	/**
+	 * Count unique users per day who hit the daily minutes limit, to see whether
+	 * the safety valve ever affects real usage
+	 */
+	private function logDailyLimitHit(int $userID, string $tier, string $subType): void {
+		$tableName = Z_CONFIG::$TTS_TABLE;
+		$dailyKey = $this->getDailyPeriodKey();
+		$client = self::detectClientPlatform($_SERVER['HTTP_USER_AGENT'] ?? '');
+		try {
+			$ddb = Z_Core::$AWS->createDynamoDb();
+			$ddb->putItem([
+				'TableName' => $tableName,
+				'Item' => [
+					'PK' => ['S' => 'DAILY_LIMIT_HIT'],
+					'SK' => ['S' => "$dailyKey#$userID"],
+					'timestamp' => ['S' => gmdate('c')],
+					'tier' => ['S' => $tier],
+					'subType' => ['S' => $subType],
+					'client' => ['S' => $client],
+					'expiresAt' => self::expiresAt(self::USER_DATA_RETENTION_DAYS),
+				],
+				'ConditionExpression' => 'attribute_not_exists(PK)',
+			]);
+			// $client is from a fixed set (desktop/ios/android/other), so the
+			// attribute name is safe to interpolate
+			$ddb->updateItem([
+				'TableName' => $tableName,
+				'Key' => [
+					'PK' => ['S' => 'DAILY_STATS'],
+					'SK' => ['S' => $dailyKey],
+				],
+				'UpdateExpression' => 'ADD dailyLimitUsers :one, client' . ucfirst($client) . 'DailyLimitUsers :one',
+				'ExpressionAttributeValues' => [
+					':one' => ['N' => '1'],
+				],
+			]);
+		}
+		catch (\Aws\DynamoDb\Exception\DynamoDbException $e) {
+			if ($e->getAwsErrorCode() !== 'ConditionalCheckFailedException') {
+				Z_Core::logError("WARNING: Failed to log TTS daily limit hit: $e");
+			}
+		}
+	}
+
+
+	/**
+	 * Record the first time each month a user hits the monthly cap for a
+	 * tier/subscription type, for measuring cap-to-subscription conversion. Later
+	 * hits in the same month are no-ops.
+	 */
+	private function logFirstCapHit(int $userID, string $tier, array $usage): void {
+		$tableName = Z_CONFIG::$TTS_TABLE;
+		$subType = $usage['subType'];
+		$now = gmdate('c');
+		try {
+			$ddb = Z_Core::$AWS->createDynamoDb();
+			$ddb->putItem([
+				'TableName' => $tableName,
+				'Item' => [
+					'PK' => ['S' => 'CAP_HIT'],
+					'SK' => ['S' => "{$this->getMonthlyPeriodKey()}#$tier#$subType#$userID"],
+					'firstHitAt' => ['S' => $now],
+					'limit' => ['N' => (string) $usage['limit']],
+					'client' => ['S' => self::detectClientPlatform($_SERVER['HTTP_USER_AGENT'] ?? '')],
+					'expiresAt' => self::expiresAt(self::USER_DATA_RETENTION_DAYS),
+				],
+				'ConditionExpression' => 'attribute_not_exists(PK)',
+			]);
+			$ddb->updateItem([
+				'TableName' => $tableName,
+				'Key' => [
+					'PK' => ['S' => 'DAILY_STATS'],
+					'SK' => ['S' => $this->getDailyPeriodKey()],
+				],
+				'UpdateExpression' => 'ADD #hits :one',
+				'ExpressionAttributeNames' => [
+					'#hits' => "capFirstHits#$tier#$subType",
+				],
+				'ExpressionAttributeValues' => [
+					':one' => ['N' => '1'],
+				],
+			]);
+		}
+		catch (\Aws\DynamoDb\Exception\DynamoDbException $e) {
+			if ($e->getAwsErrorCode() !== 'ConditionalCheckFailedException') {
+				Z_Core::logError("WARNING: Failed to log TTS cap hit: $e");
+			}
 		}
 	}
 
@@ -970,6 +1222,15 @@ class TTSController extends ApiController {
 	}
 
 
+	/**
+	 * DynamoDB TTL value for an item that should expire after the given number
+	 * of days
+	 */
+	private static function expiresAt(int $days): array {
+		return ['N' => (string) (time() + $days * 86400)];
+	}
+
+
 	private function logUsage(int $userID, string $tier, float $creditCost, array $meta = []): void {
 		$creditCost = round($creditCost, 4);
 		$tableName = Z_CONFIG::$TTS_TABLE;
@@ -988,6 +1249,7 @@ class TTSController extends ApiController {
 			'timestamp' => ['S' => $now],
 			'creditCost' => ['N' => (string) $creditCost],
 			'tier' => ['S' => $tier],
+			'expiresAt' => self::expiresAt(self::USER_DATA_RETENTION_DAYS),
 		];
 		if (!empty($meta['voiceID'])) {
 			$item['voiceID'] = ['S' => $meta['voiceID']];
@@ -1025,9 +1287,10 @@ class TTSController extends ApiController {
 				'PK' => ['S' => "USER#$userID"],
 				'SK' => ['S' => "COUNTER#{$feature}#{$monthlyKey}"],
 			],
-			'UpdateExpression' => 'SET updatedAt = :now ADD creditsUsed :creditCost, requests :one',
+			'UpdateExpression' => 'SET updatedAt = :now, expiresAt = :exp ADD creditsUsed :creditCost, requests :one',
 			'ExpressionAttributeValues' => [
 				':now' => ['S' => $now],
+				':exp' => self::expiresAt(self::USER_DATA_RETENTION_DAYS),
 				':creditCost' => ['N' => (string) $creditCost],
 				':one' => ['N' => '1'],
 			],
@@ -1053,9 +1316,10 @@ class TTSController extends ApiController {
 				'PK' => ['S' => "USER#$userID"],
 				'SK' => ['S' => "COUNTER#DAILY#$dailyKey"],
 			],
-			'UpdateExpression' => 'SET updatedAt = :now ADD minutesUsed :minutes, requests :one',
+			'UpdateExpression' => 'SET updatedAt = :now, expiresAt = :exp ADD minutesUsed :minutes, requests :one',
 			'ExpressionAttributeValues' => [
 				':now' => ['S' => $now],
+				':exp' => self::expiresAt(self::USER_DATA_RETENTION_DAYS),
 				':minutes' => ['N' => (string) $durationMinutes],
 				':one' => ['N' => '1'],
 			],
@@ -1082,6 +1346,7 @@ class TTSController extends ApiController {
 					'Item' => [
 						'PK' => ['S' => 'VOICE_DAILY_FIRST'],
 						'SK' => ['S' => "$dailyKey#$lang#$voiceID#$userID"],
+						'expiresAt' => self::expiresAt(self::MARKER_RETENTION_DAYS),
 					],
 					'ConditionExpression' => 'attribute_not_exists(PK)',
 				]);
@@ -1144,11 +1409,24 @@ class TTSController extends ApiController {
 		if ($client) {
 			$dailyUpdateExpr .= ", client" . ucfirst($client) . "DurationSeconds :dur";
 		}
+		// Per-plan audio duration (seconds), total and premium. Plan types are from
+		// a fixed set (free/personal/lab/institutional), so the attribute names are
+		// safe to interpolate.
+		$plan = ucfirst($this->getTTSCreditLimits($userID)['subType']);
+		$dailyUpdateExpr .= ", plan{$plan}DurationSeconds :dur";
+		if ($tier === 'premium') {
+			$dailyUpdateExpr .= ", plan{$plan}PremiumDurationSeconds :dur";
+		}
 		if ($provider) {
 			$dailyUpdateExpr .= ", {$provider}Requests :one, {$provider}DurationSeconds :dur";
 			if (!$cacheHit && $synthesisMS > 0) {
 				$dailyUpdateExpr .= ", {$provider}SynthesisMS :ms, {$provider}SynthesisCalls :one";
 				$dailyValues[':ms'] = ['N' => (string) $synthesisMS];
+				// Characters sent to the provider, which is what most providers bill by
+				if (!empty($meta['text'])) {
+					$dailyUpdateExpr .= ", {$provider}SynthesisChars :chars";
+					$dailyValues[':chars'] = ['N' => (string) mb_strlen($meta['text'])];
+				}
 			}
 		}
 		$ddb->updateItem([
@@ -1168,17 +1446,19 @@ class TTSController extends ApiController {
 				'Item' => [
 					'PK' => ['S' => 'DAILY_FIRST'],
 					'SK' => ['S' => "$dailyKey#$userID"],
+					'expiresAt' => self::expiresAt(self::MARKER_RETENTION_DAYS),
 				],
 				'ConditionExpression' => 'attribute_not_exists(PK)',
 			]);
-			// New user for today -- increment unique user count
+			// New user for today -- increment unique user counts, overall and for
+			// the user's plan
 			$ddb->updateItem([
 				'TableName' => $tableName,
 				'Key' => [
 					'PK' => ['S' => 'DAILY_STATS'],
 					'SK' => ['S' => $dailyKey],
 				],
-				'UpdateExpression' => 'ADD uniqueUsers :one',
+				'UpdateExpression' => "ADD uniqueUsers :one, plan{$plan}Users :one",
 				'ExpressionAttributeValues' => [
 					':one' => ['N' => '1'],
 				],
@@ -1190,21 +1470,33 @@ class TTSController extends ApiController {
 			}
 		}
 
-		// Per-user monthly usage by provider (for setting credit limits)
+		// Per-user monthly usage by provider (for setting credit limits), with the
+		// user's plan and institution for usage by plan type and per institution
 		if ($provider) {
+			$limits = $this->getTTSCreditLimits($userID);
+			$monthlyValues = [
+				':now' => ['S' => $now],
+				':one' => ['N' => '1'],
+				':dur' => ['N' => (string) $durationSeconds],
+				':subType' => ['S' => $limits['subType']],
+				':exp' => self::expiresAt(self::USER_DATA_RETENTION_DAYS),
+			];
+			// 'subType' is a DynamoDB reserved word
+			$monthlySet = 'SET updatedAt = :now, #subType = :subType, expiresAt = :exp';
+			if ($limits['institutionID']) {
+				$monthlySet .= ', institutionID = :inst';
+				$monthlyValues[':inst'] = ['N' => (string) $limits['institutionID']];
+			}
 			$ddb->updateItem([
 				'TableName' => $tableName,
 				'Key' => [
 					'PK' => ['S' => 'MONTHLY_USERS'],
 					'SK' => ['S' => "$monthlyKey#$userID"],
 				],
-				'UpdateExpression' => 'SET updatedAt = :now'
+				'UpdateExpression' => $monthlySet
 					. " ADD {$provider}Requests :one, {$provider}DurationSeconds :dur",
-				'ExpressionAttributeValues' => [
-					':now' => ['S' => $now],
-					':one' => ['N' => '1'],
-					':dur' => ['N' => (string) $durationSeconds],
-				],
+				'ExpressionAttributeNames' => ['#subType' => 'subType'],
+				'ExpressionAttributeValues' => $monthlyValues,
 			]);
 		}
 
@@ -1220,6 +1512,7 @@ class TTSController extends ApiController {
 					'Item' => [
 						'PK' => ['S' => 'TEXT_SEEN'],
 						'SK' => ['S' => "$monthlyKey#$lang#$provider#$textHash"],
+						'expiresAt' => self::expiresAt(self::MARKER_RETENTION_DAYS),
 					],
 					'ConditionExpression' => 'attribute_not_exists(PK)',
 				]);

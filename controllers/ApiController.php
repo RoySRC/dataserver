@@ -68,6 +68,7 @@ class ApiController extends Controller {
 	protected $libraryVersionOnFailure = false;
 	protected $headers = [];
 	protected $isLegacySchemaClient = false;
+	protected $errorRateLimit;
 	
 	private $startTime = false;
 	private $timeLogged = false;
@@ -103,6 +104,7 @@ class ApiController extends Controller {
 		}
 		
 		register_shutdown_function(array($this, 'finishConcurrentRequest'));
+		register_shutdown_function(array($this, 'recordErrorForLimiter'));
 		register_shutdown_function(array($this, 'checkDBTransactionState'));
 		register_shutdown_function(array($this, 'logTotalRequestTime'));
 		register_shutdown_function(array($this, 'checkForFatalError'));
@@ -327,8 +329,10 @@ class ApiController extends Controller {
 			}
 		}
 		
-		// Request limiter needs initialized authentication parameters
-		$this->initRequestLimiter();
+		// Make sure the authenticated user isn't banned
+		if (!empty($this->userID) && !Zotero_Users::isValidUser($this->userID)) {
+			$this->e403('Forbidden');
+		}
 		
 		// Work around bug in Zotero Connector direct-to-server setup
 		if ($_SERVER["REQUEST_URI"] == '/users/undefined/keys/current') {
@@ -503,7 +507,10 @@ class ApiController extends Controller {
 			// Don't show trashed items in publications view
 			$this->queryParams['includeTrashed'] = false;
 		}
-		
+
+		// Request limiter needs initialized authentication parameters, fileMode, and queryParams
+		$this->initRequestLimiter();
+
 		// Sorting by Item Type or Added By currently require writing to shard tables, so don't
 		// send those to the read replicas
 		if ($this->queryParams['sort'] == 'itemType' || $this->queryParams['sort'] == 'addedBy') {
@@ -660,25 +667,42 @@ class ApiController extends Controller {
 		if (empty($limits['rate']) && empty($limits['concurrency'])) {
 			return;
 		}
-		
-		// Skip if logOnly parameter isn't set
-		// (other parameters are checked in Z_RequestLimiter)
-		if (!empty($limits['rate']) && !isset($limits['rate']['logOnly']) ||
-			!empty($limits['concurrency']) && !isset($limits['concurrency']['logOnly'])) {
-			Z_Core::logError('Warning: Missing logOnly parameter, skipping request limiter');
+
+		// Skip if failed to initialize (i.e. Redis error)
+		try {
+			if (!Z_RequestLimiter::init()) return;
+		}
+		catch (Exception $e) {
+			Zotero::logError("Warning: " . $e->getMessage());
 			return;
 		}
-		
-		// Skip if failed to initialize (i.e. Redis error)
-		if (!Z_RequestLimiter::init()) return;
-		
+
+		// Error rate limit: peek (don't consume) at request entry. The
+		// actual debit happens in recordErrorForLimiter() if the response
+		// is 4xx.
+		if (!empty($limits['errors'])) {
+			$this->errorRateLimit = $limits['errors'];
+			if (Z_RequestLimiter::peekBucketRate($limits['errors']) === false) {
+				StatsD::increment('api.request.limit.errors.rejected', 1);
+				Z_Core::logError(($limits['errors']['logOnly'] ? '(WARN) ' : '')
+					. 'Error rate limit exceeded for ' . $limits['errors']['bucket']
+					. ' for ' . $this->method . ' to ' . $_SERVER['REQUEST_URI']
+					. ' (' . ($_SERVER['HTTP_USER_AGENT'] ?? '') . ')');
+				if (!$limits['errors']['logOnly']) {
+					header('Retry-After: ' . (int) ($limits['errors']['capacity'] / $limits['errors']['replenishRate']));
+					$this->e429('Too many invalid requests');
+				}
+			}
+		}
+
 		// Initialize rate limiter
 		if (!empty($limits['rate'])) {
 			if (Z_RequestLimiter::checkBucketRate($limits['rate']) === false) {
 				StatsD::increment('api.request.limit.rate.rejected', 1);
 				Z_Core::logError(($limits['rate']['logOnly'] ? '(WARN) ' : '')
 					. 'Request rate limit exceeded for ' . $limits['rate']['bucket']
-					. ' for ' . $this->method . ' to ' . $_SERVER['REQUEST_URI']);
+					. ' for ' . $this->method . ' to ' . $_SERVER['REQUEST_URI']
+					. ' (' . ($_SERVER['HTTP_USER_AGENT'] ?? '') . ')');
 				if (!$limits['rate']['logOnly']) {
 					// Suggest to retry when the full capacity will be reached
 					header('Retry-After: ' . (int) $limits['rate']['capacity'] / $limits['rate']['replenishRate']);
@@ -686,17 +710,18 @@ class ApiController extends Controller {
 				}
 			}
 		}
-		
+
 		// Initialize concurrency limiter
 		if (!empty($limits['concurrency'])) {
 			if (Z_RequestLimiter::beginConcurrentRequest($limits['concurrency']) === false) {
 				StatsD::increment('api.request.limit.concurrency.rejected', 1);
 				Z_Core::logError(($limits['concurrency']['logOnly'] ? '(WARN) ' : '')
 					. 'Concurrent request limit exceeded for ' . $limits['concurrency']['bucket']
-					. ' for ' . $this->method . ' to ' . $_SERVER['REQUEST_URI']);
+					. ' for ' . $this->method . ' to ' . $_SERVER['REQUEST_URI']
+					. ' (' . ($_SERVER['HTTP_USER_AGENT'] ?? '') . ')');
 				if (!$limits['concurrency']['logOnly']) {
 					// Randomize retry suggestion delay to spread future requests in a wider time interval
-					header('Retry-After: ' . rand(1, 30));
+					header('Retry-After: ' . rand(10, 30));
 					$this->e429('Concurrent request limit exceeded');
 				}
 			}
@@ -704,58 +729,151 @@ class ApiController extends Controller {
 	}
 	
 	/**
-	 * Override this function on other controllers
-	 * to set different request limits
+	 * Override this function on other controllers to set different request limits
+	 *
+	 * Tunable values live in config/rate_limits.inc.php; this method only
+	 * selects a bucket for the current request.
+	 *
 	 * @return array ['rate'=>[], 'concurrency'=>[]]
 	 */
 	protected function limits() {
 		$limits = [];
+		$ip = IPAddress::getIP();
+
+		// Internal requests (no client IP) aren't rate- or concurrency-limited
+		if (!$ip) {
+			return $limits;
+		}
+
+		$forceEnforce = $this->isRateLimitEnforced();
+
+		// Citation/bib renders invoke server-side CSL formatting, which is
+		// expensive per request. Route them to a dedicated tighter bucket.
+		$includes = (array) ($this->queryParams['include'] ?? []);
+		$isCitation = in_array('bib', $includes, true) || in_array('citation', $includes, true);
+
 		// Rate limit
-		// For authorized request
 		if (!empty($this->userID)) {
-			// 10 requests per second, 100 requests burst
-			$limits['rate'] = [
-				'logOnly' => false,
-				'bucket' => $this->userID . '_' . $_SERVER['REMOTE_ADDR'],
-				'capacity' => 100,
-				'replenishRate' => 10
-			];
+			if ($this->fileMode) {
+				// Unlimited
+			}
+			else if ($this->name == 'FullText' && $this->action == 'itemContent') {
+				// Unlimited
+			}
+			else if ($this->name == 'Mappings') {
+				$limits['rate'] = $this->buildRateLimit(
+					'user_mappings', $this->userID . '-mappings', $forceEnforce);
+			}
+			else if ($this->isWriteMethod()) {
+				$limits['rate'] = $this->buildRateLimit(
+					'user_writes', $this->userID . '-writes', $forceEnforce);
+			}
+			else if ($isCitation) {
+				$limits['rate'] = $this->buildRateLimit(
+					'user_citation', $this->userID . '-citation', $forceEnforce);
+			}
+			else if (!empty($this->queryParams['q'])) {
+				// Slightly higher for tags (web library autocomplete)
+				if ($this->name == 'Tags') {
+					$limits['rate'] = $this->buildRateLimit(
+						'user_tag_searches', $this->userID . '-tags-searches', $forceEnforce);
+				}
+				else {
+					$limits['rate'] = $this->buildRateLimit(
+						'user_searches', $this->userID . '-searches', $forceEnforce);
+				}
+			}
+			else {
+				$limits['rate'] = $this->buildRateLimit(
+					'user_default', $this->userID, $forceEnforce);
+			}
 		}
-		// For anonymous request
 		else {
-			// 30 requests per second, no burst
-			$limits['rate'] = [
-				'logOnly' => false,
-				'bucket' => $_SERVER['REMOTE_ADDR'],
-				'capacity' => 30,
-				'replenishRate' => 30
-			];
+			if ($this->name == 'Mappings') {
+				$limits['rate'] = $this->buildRateLimit(
+					'anon_mappings', 'anon-' . $ip . '-mappings', $forceEnforce);
+			}
+			else if ($isCitation) {
+				$limits['rate'] = $this->buildRateLimit(
+					'anon_citation', 'anon-' . $ip . '-citation', $forceEnforce);
+			}
+			else {
+				$limits['rate'] = $this->buildRateLimit(
+					'anon_default', 'anon-' . $ip, $forceEnforce);
+			}
 		}
-		
+
 		// Concurrency limit
-		// For authorized request
 		if (!empty($this->userID)) {
-			// 5 concurrent requests
-			$limits['concurrency'] = [
-				'logOnly' => false,
-				'bucket' => $this->userID,
-				'capacity' => 5,
-				// Maximum possible time the request can take
-				'ttl' => 60
-			];
+			if ($this->fileMode) {
+				// Unlimited
+			}
+			else if ($this->isWriteMethod()) {
+				$limits['concurrency'] = $this->buildConcurrencyLimit(
+					'user_writes', $this->userID . '-writes', $forceEnforce);
+			}
+			else if ($isCitation) {
+				$limits['concurrency'] = $this->buildConcurrencyLimit(
+					'user_citation', $this->userID . '-citation', $forceEnforce);
+			}
+			else {
+				$limits['concurrency'] = $this->buildConcurrencyLimit(
+					'user_default', $this->userID, $forceEnforce);
+			}
 		}
-		// For anonymous request
 		else {
-			// 20 concurrent requests
-			$limits['concurrency'] = [
-				'logOnly' => false,
-				'bucket' => $_SERVER['REMOTE_ADDR'],
-				'capacity' => 20,
-				// Maximum possible time the request can take
-				'ttl' => 60
-			];
+			if ($isCitation) {
+				$limits['concurrency'] = $this->buildConcurrencyLimit(
+					'anon_citation', 'anon-' . $ip . '-citation', $forceEnforce);
+			}
+			else {
+				$limits['concurrency'] = $this->buildConcurrencyLimit(
+					'anon_default', $ip, $forceEnforce);
+			}
+		}
+
+		// Error budget: separate bucket consumed only by 4xx responses
+		// (see recordErrorForLimiter()). Lets us catch clients stuck in
+		// invalid-request loops.
+		if (!empty($this->userID)) {
+			$limits['errors'] = $this->buildRateLimit(
+				'errors_user', 'errors-user-' . $this->userID, $forceEnforce);
+		}
+		else {
+			$limits['errors'] = $this->buildRateLimit(
+				'errors_anon', 'errors-anon-' . $ip, $forceEnforce);
 		}
 		return $limits;
+	}
+
+	/**
+	 * Clients on the enforce lists override any bucket's logOnly flag
+	 */
+	protected function isRateLimitEnforced() {
+		return in_array(IPAddress::getIP(), Z_CONFIG_RATE_LIMITS::$ENFORCE_IPS)
+			|| (!empty($this->userID)
+				&& in_array($this->userID, Z_CONFIG_RATE_LIMITS::$ENFORCE_USER_IDS));
+	}
+
+	protected function buildRateLimit($key, $bucket, $forceEnforce = false) {
+		$c = Z_CONFIG_RATE_LIMITS::$RATES[$key] ?? Z_CONFIG_RATE_LIMITS::DEFAULT_RATE;
+		return [
+			'logOnly' => $forceEnforce ? false : ($c['logOnly'] ?? false),
+			'bucket' => $bucket,
+			'replenishRate' => $c['replenishRate'],
+			'capacity' => $c['capacity'],
+		];
+	}
+
+	private function buildConcurrencyLimit($key, $bucket, $forceEnforce = false) {
+		$c = Z_CONFIG_RATE_LIMITS::$CONCURRENCY[$key] ?? Z_CONFIG_RATE_LIMITS::DEFAULT_CONCURRENCY;
+		return [
+			'logOnly' => $forceEnforce ? false : ($c['logOnly'] ?? false),
+			'bucket' => $bucket,
+			'capacity' => $c['capacity'],
+			// Maximum possible time the request can take
+			'ttl' => $c['ttl'],
+		];
 	}
 	
 	protected function getFeedNamePrefix($libraryID=false) {
@@ -1474,6 +1592,26 @@ class ApiController extends Controller {
 		if (Z_RequestLimiter::isConcurrentRequestActive()) {
 			Z_RequestLimiter::finishConcurrentRequest();
 		}
+	}
+
+	/**
+	 * Debit the error rate-limit bucket if the response was a countable 4xx
+	 *
+	 * Counts: 400, 401, 403 always; 404 only for anonymous requests
+	 * (authed Zotero clients legitimately hit /items/KEY/file 404s during file sync
+	 * and 412 on conflicts)
+	 */
+	public function recordErrorForLimiter() {
+		if (!$this->errorRateLimit) {
+			return;
+		}
+		$status = $this->responseCode;
+		$countable = in_array($status, [400, 401, 403], true)
+			|| ($status === 404 && empty($this->userID));
+		if (!$countable) {
+			return;
+		}
+		Z_RequestLimiter::checkBucketRate($this->errorRateLimit);
 	}
 	
 	public function checkDBTransactionState($noLog = false) {
