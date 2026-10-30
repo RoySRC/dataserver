@@ -525,6 +525,16 @@ class TTSController extends ApiController {
 			$this->e400("'credits' must be a positive integer");
 		}
 
+		$type = $json['type'] ?? null;
+		if (!in_array($type, ['support', 'purchase'], true)) {
+			$this->e400("'type' must be 'support' or 'purchase'");
+		}
+
+		$note = $json['note'] ?? '';
+		if (!is_string($note)) {
+			$this->e400("'note' must be a string");
+		}
+
 		$tableName = Z_CONFIG::$TTS_TABLE;
 		$now = gmdate('c');
 
@@ -539,6 +549,32 @@ class TTSController extends ApiController {
 				'creditsOriginal' => ['N' => (string) $credits],
 				'createdAt' => ['S' => $now],
 			],
+		]);
+
+		// Bundles are deleted once used up, so record each one permanently, per
+		// user and in a global log for monthly counts
+		$record = [
+			'type' => ['S' => $type],
+			'credits' => ['N' => (string) $credits],
+			'createdAt' => ['S' => $now],
+		];
+		if ($note !== '') {
+			$record['note'] = ['S' => $note];
+		}
+		$ddb->putItem([
+			'TableName' => $tableName,
+			'Item' => [
+				'PK' => ['S' => "USER#$this->userID"],
+				'SK' => ['S' => "BUNDLE_HISTORY#PREMIUM#$now"],
+			] + $record,
+		]);
+		$ddb->putItem([
+			'TableName' => $tableName,
+			'Item' => [
+				'PK' => ['S' => 'BUNDLE_HISTORY'],
+				'SK' => ['S' => "$now#$this->userID"],
+				'userID' => ['N' => (string) $this->userID],
+			] + $record,
 		]);
 
 		$premiumUsage = $this->getCreditsRemaining($this->userID, 'premium');
@@ -603,13 +639,20 @@ class TTSController extends ApiController {
 			unset($v);
 			// Remove tier from provider object -- it's already the key
 			unset($provider['tier']);
+			$provider['_priority'] = $class::SORT_PRIORITY;
 			$result[$tier][] = $provider;
 		}
-		// Sort providers within each tier by creditsPerMinute
+		// Sort providers within each tier by creditsPerMinute, then by
+		// SORT_PRIORITY
 		foreach ($result as &$providers) {
 			usort($providers, function ($a, $b) {
-				return $a['creditsPerMinute'] - $b['creditsPerMinute'];
+				return ($a['creditsPerMinute'] <=> $b['creditsPerMinute'])
+					?: ($a['_priority'] <=> $b['_priority']);
 			});
+			foreach ($providers as &$p) {
+				unset($p['_priority']);
+			}
+			unset($p);
 		}
 		unset($providers);
 		return $result;
